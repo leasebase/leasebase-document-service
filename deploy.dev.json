@@ -1,0 +1,11 @@
+{
+  "aws_region": "us-west-2",
+  "aws_account_id": "335021149718",
+  "ecr_repository": "leasebase-dev-v2-document-service",
+  "ecs_cluster": "leasebase-dev-v2-cluster",
+  "ecs_service": "leasebase-dev-v2-document-service",
+  "task_family": "leasebase-dev-v2-document-service",
+  "container_name": "document-service",
+  "execution_role": "leasebase-dev-v2-ecs-execution",
+  "task_role": "leasebase-dev-v2-document-service-task"
+}
