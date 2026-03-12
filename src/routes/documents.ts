@@ -22,7 +22,7 @@ const uploadSchema = z.object({
 });
 
 // GET / - List documents
-router.get('/', requireAuth, requireRole(UserRole.ORG_ADMIN, UserRole.PM_STAFF, UserRole.OWNER),
+router.get('/', requireAuth, requireRole(UserRole.OWNER),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const user = (req as AuthenticatedRequest).user;
@@ -50,8 +50,41 @@ router.get('/', requireAuth, requireRole(UserRole.ORG_ADMIN, UserRole.PM_STAFF, 
   }
 );
 
+// GET /mine - Tenant's own documents (resolved via JWT → tenant_profiles → lease)
+router.get('/mine', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const user = (req as AuthenticatedRequest).user;
+    const pg = parsePagination(req.query as Record<string, unknown>);
+    const offset = (pg.page - 1) * pg.limit;
+
+    // Fail closed: resolve through tenant_profiles JOIN — only LEASE-related documents
+    // Exclude s3_key from tenant response (internal storage detail)
+    const [rows, countResult] = await Promise.all([
+      query(
+        `SELECT d.id, d.organization_id, d.related_type, d.related_id, d.name, d.mime_type,
+                d.created_by_user_id, d.created_at, d.updated_at
+         FROM documents d
+         JOIN tenant_profiles tp ON d.related_id = tp.lease_id AND d.related_type = 'LEASE'
+         JOIN "User" u ON tp.user_id = u.id
+         WHERE tp.user_id = $1 AND u."organizationId" = $2
+         ORDER BY d.created_at DESC LIMIT $3 OFFSET $4`,
+        [user.userId, user.orgId, pg.limit, offset],
+      ),
+      queryOne<{ count: string }>(
+        `SELECT COUNT(*) as count FROM documents d
+         JOIN tenant_profiles tp ON d.related_id = tp.lease_id AND d.related_type = 'LEASE'
+         JOIN "User" u ON tp.user_id = u.id
+         WHERE tp.user_id = $1 AND u."organizationId" = $2`,
+        [user.userId, user.orgId],
+      ),
+    ]);
+
+    res.json({ data: rows, meta: paginationMeta(Number(countResult?.count || 0), pg) });
+  } catch (err) { next(err); }
+});
+
 // POST /upload - Upload document (returns presigned upload URL)
-router.post('/upload', requireAuth, requireRole(UserRole.ORG_ADMIN, UserRole.PM_STAFF),
+router.post('/upload', requireAuth, requireRole(UserRole.OWNER),
   validateBody(uploadSchema),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
@@ -77,7 +110,7 @@ router.post('/upload', requireAuth, requireRole(UserRole.ORG_ADMIN, UserRole.PM_
 );
 
 // GET /:id - Get document metadata
-router.get('/:id', requireAuth, requireRole(UserRole.ORG_ADMIN, UserRole.PM_STAFF, UserRole.OWNER),
+router.get('/:id', requireAuth, requireRole(UserRole.OWNER),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const user = (req as AuthenticatedRequest).user;
@@ -89,7 +122,7 @@ router.get('/:id', requireAuth, requireRole(UserRole.ORG_ADMIN, UserRole.PM_STAF
 );
 
 // GET /:id/download - Get download URL
-router.get('/:id/download', requireAuth, requireRole(UserRole.ORG_ADMIN, UserRole.PM_STAFF, UserRole.OWNER),
+router.get('/:id/download', requireAuth, requireRole(UserRole.OWNER),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const user = (req as AuthenticatedRequest).user;
@@ -107,7 +140,7 @@ router.get('/:id/download', requireAuth, requireRole(UserRole.ORG_ADMIN, UserRol
 );
 
 // DELETE /:id
-router.delete('/:id', requireAuth, requireRole(UserRole.ORG_ADMIN),
+router.delete('/:id', requireAuth, requireRole(UserRole.OWNER),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const user = (req as AuthenticatedRequest).user;
