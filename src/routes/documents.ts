@@ -109,25 +109,49 @@ router.post('/upload', requireAuth, requireRole(UserRole.OWNER),
   }
 );
 
-// GET /:id - Get document metadata
-router.get('/:id', requireAuth, requireRole(UserRole.OWNER),
+// GET /:id - Get document metadata (OWNER or TENANT with lease-ownership check)
+router.get('/:id', requireAuth,
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const user = (req as AuthenticatedRequest).user;
       const row = await queryOne(`SELECT * FROM documents WHERE id = $1 AND organization_id = $2`, [req.params.id, user.orgId]);
       if (!row) throw new NotFoundError('Document not found');
+
+      // TENANT: verify document belongs to a lease the tenant owns
+      if (user.role === UserRole.TENANT) {
+        const ownership = await queryOne(
+          `SELECT tp.user_id FROM tenant_profiles tp
+           WHERE tp.user_id = $1 AND tp.lease_id = $2`,
+          [user.userId, (row as any).related_id],
+        );
+        if (!ownership) throw new NotFoundError('Document not found');
+      }
+
       res.json({ data: row });
     } catch (err) { next(err); }
   }
 );
 
-// GET /:id/download - Get download URL
-router.get('/:id/download', requireAuth, requireRole(UserRole.OWNER),
+// GET /:id/download - Get download URL (OWNER or TENANT with lease-ownership check)
+router.get('/:id/download', requireAuth,
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const user = (req as AuthenticatedRequest).user;
-      const row = await queryOne<{ s3_key: string }>(`SELECT * FROM documents WHERE id = $1 AND organization_id = $2`, [req.params.id, user.orgId]);
+      const row = await queryOne<{ s3_key: string; related_id: string }>(
+        `SELECT * FROM documents WHERE id = $1 AND organization_id = $2`,
+        [req.params.id, user.orgId],
+      );
       if (!row) throw new NotFoundError('Document not found');
+
+      // TENANT: verify document belongs to a lease the tenant owns
+      if (user.role === UserRole.TENANT) {
+        const ownership = await queryOne(
+          `SELECT tp.user_id FROM tenant_profiles tp
+           WHERE tp.user_id = $1 AND tp.lease_id = $2`,
+          [user.userId, row.related_id],
+        );
+        if (!ownership) throw new NotFoundError('Document not found');
+      }
 
       // In production, generate presigned GET URL
       const downloadUrl = S3_BUCKET
