@@ -88,7 +88,7 @@ describe('GET /:id — tenant access', () => {
     expect(res.status).toBe(404);
   });
 
-  it('uses tenant_profiles for ownership verification (not Prisma tables)', async () => {
+  it('uses lease_tenants for ownership verification (not deprecated TenantProfile)', async () => {
     activeUser.current = tenant();
     mockQueryOne
       .mockResolvedValueOnce(sampleDoc)
@@ -98,8 +98,9 @@ describe('GET /:id — tenant access', () => {
 
     // Second queryOne call = ownership check
     const ownershipSql = mockQueryOne.mock.calls[1][0] as string;
-    expect(ownershipSql).toContain('tenant_profiles');
+    expect(ownershipSql).toContain('lease_tenants');
     expect(ownershipSql).not.toContain('"TenantProfile"');
+    expect(ownershipSql).not.toContain('tenant_profiles');
   });
 
   it('allows OWNER to view document without ownership check', async () => {
