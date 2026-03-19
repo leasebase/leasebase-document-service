@@ -22,7 +22,7 @@ const uploadSchema = z.object({
 });
 
 // GET / - List documents
-router.get('/', requireAuth, requireRole(UserRole.ORG_ADMIN, UserRole.PM_STAFF, UserRole.OWNER),
+router.get('/', requireAuth, requireRole(UserRole.OWNER),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const user = (req as AuthenticatedRequest).user;
@@ -50,8 +50,41 @@ router.get('/', requireAuth, requireRole(UserRole.ORG_ADMIN, UserRole.PM_STAFF, 
   }
 );
 
+// GET /mine - Tenant's own documents (resolved via JWT → lease_tenants → lease)
+router.get('/mine', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const user = (req as AuthenticatedRequest).user;
+    const pg = parsePagination(req.query as Record<string, unknown>);
+    const offset = (pg.page - 1) * pg.limit;
+
+    // Fail closed: resolve through lease_tenants JOIN — only LEASE-related documents
+    // Exclude s3_key from tenant response (internal storage detail)
+    const [rows, countResult] = await Promise.all([
+      query(
+        `SELECT d.id, d.organization_id, d.related_type, d.related_id, d.name, d.mime_type,
+                d.created_by_user_id, d.created_at, d.updated_at
+         FROM documents d
+         JOIN lease_service.lease_tenants lt ON d.related_id = lt.lease_id AND d.related_type = 'LEASE'
+         JOIN lease_service.leases l ON l.id = lt.lease_id AND l.org_id = $2
+         WHERE lt.tenant_id = $1
+         ORDER BY d.created_at DESC LIMIT $3 OFFSET $4`,
+        [user.userId, user.orgId, pg.limit, offset],
+      ),
+      queryOne<{ count: string }>(
+        `SELECT COUNT(*) as count FROM documents d
+         JOIN lease_service.lease_tenants lt ON d.related_id = lt.lease_id AND d.related_type = 'LEASE'
+         JOIN lease_service.leases l ON l.id = lt.lease_id AND l.org_id = $2
+         WHERE lt.tenant_id = $1`,
+        [user.userId, user.orgId],
+      ),
+    ]);
+
+    res.json({ data: rows, meta: paginationMeta(Number(countResult?.count || 0), pg) });
+  } catch (err) { next(err); }
+});
+
 // POST /upload - Upload document (returns presigned upload URL)
-router.post('/upload', requireAuth, requireRole(UserRole.ORG_ADMIN, UserRole.PM_STAFF),
+router.post('/upload', requireAuth, requireRole(UserRole.OWNER),
   validateBody(uploadSchema),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
@@ -76,25 +109,49 @@ router.post('/upload', requireAuth, requireRole(UserRole.ORG_ADMIN, UserRole.PM_
   }
 );
 
-// GET /:id - Get document metadata
-router.get('/:id', requireAuth, requireRole(UserRole.ORG_ADMIN, UserRole.PM_STAFF, UserRole.OWNER),
+// GET /:id - Get document metadata (OWNER or TENANT with lease-ownership check)
+router.get('/:id', requireAuth,
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const user = (req as AuthenticatedRequest).user;
       const row = await queryOne(`SELECT * FROM documents WHERE id = $1 AND organization_id = $2`, [req.params.id, user.orgId]);
       if (!row) throw new NotFoundError('Document not found');
+
+      // TENANT: verify document belongs to a lease the tenant owns (via lease_tenants)
+      if (user.role === UserRole.TENANT) {
+        const ownership = await queryOne(
+          `SELECT lt.tenant_id AS user_id FROM lease_service.lease_tenants lt
+           WHERE lt.tenant_id = $1 AND lt.lease_id = $2`,
+          [user.userId, (row as any).related_id],
+        );
+        if (!ownership) throw new NotFoundError('Document not found');
+      }
+
       res.json({ data: row });
     } catch (err) { next(err); }
   }
 );
 
-// GET /:id/download - Get download URL
-router.get('/:id/download', requireAuth, requireRole(UserRole.ORG_ADMIN, UserRole.PM_STAFF, UserRole.OWNER),
+// GET /:id/download - Get download URL (OWNER or TENANT with lease-ownership check)
+router.get('/:id/download', requireAuth,
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const user = (req as AuthenticatedRequest).user;
-      const row = await queryOne<{ s3_key: string }>(`SELECT * FROM documents WHERE id = $1 AND organization_id = $2`, [req.params.id, user.orgId]);
+      const row = await queryOne<{ s3_key: string; related_id: string }>(
+        `SELECT * FROM documents WHERE id = $1 AND organization_id = $2`,
+        [req.params.id, user.orgId],
+      );
       if (!row) throw new NotFoundError('Document not found');
+
+      // TENANT: verify document belongs to a lease the tenant owns (via lease_tenants)
+      if (user.role === UserRole.TENANT) {
+        const ownership = await queryOne(
+          `SELECT lt.tenant_id AS user_id FROM lease_service.lease_tenants lt
+           WHERE lt.tenant_id = $1 AND lt.lease_id = $2`,
+          [user.userId, row.related_id],
+        );
+        if (!ownership) throw new NotFoundError('Document not found');
+      }
 
       // In production, generate presigned GET URL
       const downloadUrl = S3_BUCKET
@@ -107,7 +164,7 @@ router.get('/:id/download', requireAuth, requireRole(UserRole.ORG_ADMIN, UserRol
 );
 
 // DELETE /:id
-router.delete('/:id', requireAuth, requireRole(UserRole.ORG_ADMIN),
+router.delete('/:id', requireAuth, requireRole(UserRole.OWNER),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const user = (req as AuthenticatedRequest).user;
