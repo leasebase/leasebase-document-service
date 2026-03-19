@@ -10,3 +10,8 @@ document_service.documents.id
 document_service.documents.organization_id
 document_service.documents.related_type
 document_service.documents.related_id
+
+# Cross-schema reads (tenant document access control via lease membership)
+lease_service.leases.id
+lease_service.lease_tenants.lease_id
+lease_service.lease_tenants.tenant_id
