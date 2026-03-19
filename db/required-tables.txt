@@ -1,0 +1,12 @@
+# document-service runtime-critical DB dependencies
+# Format: schema.table or schema.table.column
+# Used by the advisory schema drift checker during deploys.
+
+# Core identity (read via service-common requireAuth)
+public.User.id
+
+# Documents (document-service owns this table)
+document_service.documents.id
+document_service.documents.organization_id
+document_service.documents.related_type
+document_service.documents.related_id
