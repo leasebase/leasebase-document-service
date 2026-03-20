@@ -48,6 +48,11 @@ document_service.signature_request_signers.signature_request_id
 document_service.signature_request_events.id
 document_service.signature_request_events.signature_request_id
 
+# Phase 3 — E-sign provider integration columns
+document_service.signature_request_signers.provider_signer_id
+document_service.signature_request_signers.sign_url
+document_service.signature_request_events.provider_event_id
+
 # Cross-schema reads (tenant document access control via lease membership)
 lease_service.leases.id
 lease_service.lease_tenants.lease_id
