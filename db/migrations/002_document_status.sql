@@ -9,6 +9,12 @@
 --
 -- Idempotent: safe to re-run (IF NOT EXISTS and existence-check guards).
 --
+-- migrate:no-transaction
+-- This migration uses DO $$ anonymous blocks which cannot run inside the
+-- BEGIN/EXCEPTION/END subtransaction created by the migration runner's
+-- transactional wrapper. Running without a savepoint wrapper allows the
+-- inner DO blocks to execute correctly.
+--
 -- Run as leasebase_admin:
 --   psql -h <host> -U leasebase_admin -d leasebase -f db/migrations/002_document_status.sql
 
