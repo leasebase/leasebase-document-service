@@ -38,6 +38,55 @@ const confirmSchema = z.object({
   status: z.enum(['EXECUTED', 'CONFIRMED_EXTERNAL']),
 });
 
+// ── Internal service key validation ─────────────────────────────────────────
+// Validates X-Internal-Service-Key header for service-to-service calls.
+// Returns true if key is valid, false (and sends 401) if not.
+// NOTE: env var is read lazily (at call time, not module load time) so that
+// test environments can set it after module initialization.
+function validateInternalKey(req: Request, res: Response): boolean {
+  const configuredKey = process.env.INTERNAL_SERVICE_KEY || '';
+  const key = req.headers['x-internal-service-key'];
+  if (!configuredKey || key !== configuredKey) {
+    res.status(401).json({ error: { code: 'UNAUTHORIZED', message: 'Invalid or missing internal service key' } });
+    return false;
+  }
+  return true;
+}
+
+// ── GET /lease-proof — Internal: check if a lease has qualifying document proof ──
+//
+// Used by lease-service before activating a lease.
+// Returns { qualified: boolean } where qualified=true means at least one
+// LEASE document with status EXECUTED or CONFIRMED_EXTERNAL exists for the lease.
+//
+// Protected by INTERNAL_SERVICE_KEY — not exposed to public clients.
+// The BFF gateway does NOT proxy /internal/* routes to public callers.
+//
+// Query parameters:
+//   leaseId       - the lease ID to check
+//   organizationId - org scoping guard
+router.get('/lease-proof', (req: Request, res: Response, next: NextFunction) => {
+  if (!validateInternalKey(req, res)) return;
+  const { leaseId, organizationId } = req.query as { leaseId?: string; organizationId?: string };
+  if (!leaseId || !organizationId) {
+    return res.status(400).json({ error: { code: 'MISSING_PARAMS', message: 'leaseId and organizationId are required' } });
+  }
+  queryOne<{ id: string; status: string }>(
+    `SELECT id, status
+     FROM documents
+     WHERE related_id = $1
+       AND related_type = 'LEASE'
+       AND organization_id = $2
+       AND status IN ('EXECUTED', 'CONFIRMED_EXTERNAL')
+     LIMIT 1`,
+    [leaseId, organizationId],
+  )
+    .then((row) => {
+      res.json({ qualified: !!row, document: row || null });
+    })
+    .catch(next);
+});
+
 // GET / - List documents
 router.get('/', requireAuth, requireRole(UserRole.OWNER),
   async (req: Request, res: Response, next: NextFunction) => {
