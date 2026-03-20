@@ -61,6 +61,7 @@ const owner = (overrides: Record<string, any> = {}) => ({
 const sampleUploadedDoc = {
   id: 'doc-1', organization_id: 'org-1', related_type: 'LEASE', related_id: 'lease-1',
   name: 'Lease.pdf', s3_key: 'org-1/LEASE/lease-1/lease.pdf', mime_type: 'application/pdf',
+  title: 'Lease Agreement', category: 'OWNER_UPLOAD',
   created_by_user_id: 'o1', status: 'UPLOADED', created_at: '2024-01-01', updated_at: '2024-01-01',
 };
 
@@ -115,35 +116,42 @@ describe('POST /upload — status field', () => {
 // ════════════════════════════════════════════════════════════════════════════
 
 describe('POST /:id/confirm — confirm document execution status', () => {
-  it('promotes UPLOADED document to CONFIRMED_EXTERNAL', async () => {
+  it('promotes UPLOADED document to VERIFIED_EXTERNAL (via CONFIRMED_EXTERNAL legacy input)', async () => {
     activeUser.current = owner();
     // First call: SELECT existing document
     mockQueryOne.mockResolvedValueOnce({ ...sampleUploadedDoc, status: 'UPLOADED' });
-    // Second call: UPDATE RETURNING
-    mockQueryOne.mockResolvedValueOnce({ ...sampleUploadedDoc, status: 'CONFIRMED_EXTERNAL' });
+    // Second call: UPDATE RETURNING (normalized to VERIFIED_EXTERNAL)
+    mockQueryOne.mockResolvedValueOnce({ ...sampleUploadedDoc, status: 'VERIFIED_EXTERNAL' });
+    // Third call: audit INSERT
+    mockQueryOne.mockResolvedValueOnce(null);
 
     const res = await reqWithBody(port, 'POST', '/d/doc-1/confirm', { status: 'CONFIRMED_EXTERNAL' });
     expect(res.status).toBe(200);
-    expect(res.body.data.status).toBe('CONFIRMED_EXTERNAL');
+    // The UPDATE should pass VERIFIED_EXTERNAL as the $1 param
+    const updateParams = mockQueryOne.mock.calls[1][1] as any[];
+    expect(updateParams[0]).toBe('VERIFIED_EXTERNAL');
   });
 
-  it('promotes UPLOADED document to EXECUTED', async () => {
+  it('promotes UPLOADED document to FULLY_EXECUTED (via EXECUTED legacy input)', async () => {
     activeUser.current = owner();
     mockQueryOne.mockResolvedValueOnce({ ...sampleUploadedDoc, status: 'UPLOADED' });
-    mockQueryOne.mockResolvedValueOnce({ ...sampleUploadedDoc, status: 'EXECUTED' });
+    mockQueryOne.mockResolvedValueOnce({ ...sampleUploadedDoc, status: 'FULLY_EXECUTED' });
+    mockQueryOne.mockResolvedValueOnce(null); // audit
 
     const res = await reqWithBody(port, 'POST', '/d/doc-1/confirm', { status: 'EXECUTED' });
     expect(res.status).toBe(200);
-    expect(res.body.data.status).toBe('EXECUTED');
+    const updateParams = mockQueryOne.mock.calls[1][1] as any[];
+    expect(updateParams[0]).toBe('FULLY_EXECUTED');
   });
 
-  it('is idempotent when document is already at the target status', async () => {
+  it('is idempotent when document is already VERIFIED_EXTERNAL (sent as CONFIRMED_EXTERNAL)', async () => {
     activeUser.current = owner();
-    // SELECT returns document already at CONFIRMED_EXTERNAL
+    // SELECT returns document already at CONFIRMED_EXTERNAL (legacy, pre-migration)
     mockQueryOne.mockResolvedValueOnce({ ...sampleUploadedDoc, status: 'CONFIRMED_EXTERNAL' });
 
     const res = await reqWithBody(port, 'POST', '/d/doc-1/confirm', { status: 'CONFIRMED_EXTERNAL' });
     expect(res.status).toBe(200);
+    // Cross-vocab idempotency: CONFIRMED_EXTERNAL === VERIFIED_EXTERNAL target
     // No UPDATE should have been issued (only 1 queryOne call — the SELECT)
     expect(mockQueryOne).toHaveBeenCalledTimes(1);
   });
@@ -191,29 +199,31 @@ describe('GET /lease-proof — internal activation proof check', () => {
 
   const validHeaders = { 'x-internal-service-key': TEST_INTERNAL_KEY };
 
-  it('returns qualified=true when EXECUTED lease document exists', async () => {
-    mockQueryOne.mockResolvedValueOnce({ id: 'doc-1', status: 'EXECUTED' });
+  it('returns qualified=true when FULLY_EXECUTED lease document exists', async () => {
+    mockQueryOne.mockResolvedValueOnce({ id: 'doc-1', status: 'FULLY_EXECUTED' });
 
     const res = await reqWithBody(port, 'GET', '/d/lease-proof?leaseId=lease-1&organizationId=org-1', undefined, validHeaders);
     expect(res.status).toBe(200);
     expect(res.body.qualified).toBe(true);
     expect(res.body.document.id).toBe('doc-1');
-    expect(res.body.document.status).toBe('EXECUTED');
+    expect(res.body.document.status).toBe('FULLY_EXECUTED');
 
     // Verify the query scopes to LEASE type and correct statuses
     const sql = mockQueryOne.mock.calls[0][0] as string;
     expect(sql).toContain("related_type = 'LEASE'");
-    expect(sql).toContain("'EXECUTED'");
-    expect(sql).toContain("'CONFIRMED_EXTERNAL'");
+    // Status values are passed as params (not inline) — verify they appear in params
+    const params = mockQueryOne.mock.calls[0][1] as any[];
+    expect(params).toContain('FULLY_EXECUTED');
+    expect(params).toContain('VERIFIED_EXTERNAL');
   });
 
-  it('returns qualified=true when CONFIRMED_EXTERNAL lease document exists', async () => {
-    mockQueryOne.mockResolvedValueOnce({ id: 'doc-2', status: 'CONFIRMED_EXTERNAL' });
+  it('returns qualified=true when VERIFIED_EXTERNAL lease document exists', async () => {
+    mockQueryOne.mockResolvedValueOnce({ id: 'doc-2', status: 'VERIFIED_EXTERNAL' });
 
     const res = await reqWithBody(port, 'GET', '/d/lease-proof?leaseId=lease-1&organizationId=org-1', undefined, validHeaders);
     expect(res.status).toBe(200);
     expect(res.body.qualified).toBe(true);
-    expect(res.body.document.status).toBe('CONFIRMED_EXTERNAL');
+    expect(res.body.document.status).toBe('VERIFIED_EXTERNAL');
   });
 
   it('returns qualified=false when only UPLOADED lease document exists', async () => {
@@ -225,9 +235,9 @@ describe('GET /lease-proof — internal activation proof check', () => {
     expect(res.body.qualified).toBe(false);
     expect(res.body.document).toBeNull();
 
-    // Verify UPLOADED is not in the qualifying statuses in the SQL
-    const sql = mockQueryOne.mock.calls[0][0] as string;
-    expect(sql).not.toContain("'UPLOADED'");
+    // Verify UPLOADED is not in the qualifying status params
+    const params = mockQueryOne.mock.calls[0][1] as any[];
+    expect(params).not.toContain('UPLOADED');
   });
 
   it('returns qualified=false when no lease documents exist', async () => {

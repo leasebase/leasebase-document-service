@@ -10,6 +10,22 @@ document_service.documents.id
 document_service.documents.organization_id
 document_service.documents.related_type
 document_service.documents.related_id
+document_service.documents.category
+document_service.documents.title
+document_service.documents.status
+document_service.documents.current_version_id
+document_service.documents.archived_at
+
+# Document versions (Phase 1 — file storage metadata)
+document_service.document_versions.id
+document_service.document_versions.document_id
+document_service.document_versions.storage_bucket
+document_service.document_versions.storage_key
+
+# Document audit events (Phase 1 — immutable audit trail)
+document_service.document_audit_events.id
+document_service.document_audit_events.document_id
+document_service.document_audit_events.event_type
 
 # Cross-schema reads (tenant document access control via lease membership)
 lease_service.leases.id
