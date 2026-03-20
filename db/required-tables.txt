@@ -27,6 +27,27 @@ document_service.document_audit_events.id
 document_service.document_audit_events.document_id
 document_service.document_audit_events.event_type
 
+# Phase 2 — Templates
+document_service.document_templates.id
+document_service.document_templates.organization_id
+document_service.document_template_versions.id
+document_service.document_template_versions.template_id
+document_service.document_template_variables.id
+document_service.document_template_variables.template_version_id
+
+# Phase 2 — Generated documents
+document_service.generated_documents.id
+document_service.generated_documents.document_id
+
+# Phase 2 — Signature requests
+document_service.signature_requests.id
+document_service.signature_requests.document_id
+document_service.signature_requests.status
+document_service.signature_request_signers.id
+document_service.signature_request_signers.signature_request_id
+document_service.signature_request_events.id
+document_service.signature_request_events.signature_request_id
+
 # Cross-schema reads (tenant document access control via lease membership)
 lease_service.leases.id
 lease_service.lease_tenants.lease_id
