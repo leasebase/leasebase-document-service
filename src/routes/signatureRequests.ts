@@ -4,6 +4,7 @@ import {
   requireAuth, requireRole, queryOne, query, NotFoundError, AppError, logger,
   type AuthenticatedRequest, UserRole,
 } from '@leasebase/service-common';
+import { getESignProvider } from '../providers/esign/index.js';
 
 const router = Router();
 
@@ -107,6 +108,10 @@ const signerSchema = z.object({
 
 const createSignatureRequestSchema = z.object({
   signers: z.array(signerSchema).min(1),
+  // Phase 3: if true, send to provider immediately; if false, manual flow
+  useProvider: z.boolean().default(false),
+  subject:     z.string().optional(),
+  message:     z.string().optional(),
 });
 
 const patchSignatureRequestSchema = z.object({
@@ -151,6 +156,11 @@ router.post('/documents/:documentId/signature-requests', requireAuth, requireRol
       );
       if (!sigReq) throw new AppError('DB_ERROR', 500, 'Failed to create signature request');
 
+      // Determine provider name
+      const providerName = parsed.data.useProvider
+        ? (process.env.ESIGN_PROVIDER ?? 'MANUAL').toUpperCase()
+        : 'MANUAL';
+
       // Add signers
       const insertedSigners = [];
       for (const signer of parsed.data.signers) {
@@ -163,6 +173,85 @@ router.post('/documents/:documentId/signature-requests', requireAuth, requireRol
            signer.email || null, signer.display_name || null, signer.routing_order],
         );
         insertedSigners.push(signerRow);
+      }
+
+      // Phase 3: call provider if requested
+      if (parsed.data.useProvider && providerName !== 'MANUAL') {
+        try {
+          const provider = getESignProvider();
+
+          // Resolve document download URL for provider
+          const docVersion = await queryOne<{ storage_key: string; storage_bucket: string }>(
+            `SELECT storage_key, storage_bucket FROM document_service.document_versions
+             WHERE document_id = $1 ORDER BY version_number DESC LIMIT 1`,
+            [doc.id],
+          );
+
+          // Build signer list — email is required for provider
+          const providerSigners = parsed.data.signers.map((s, i) => ({
+            userId:       s.user_id,
+            name:         s.display_name || s.email || s.user_id,
+            email:        s.email || '',
+            routingOrder: s.routing_order || (i + 1),
+          }));
+
+          const missingEmails = providerSigners.filter((s) => !s.email);
+          if (missingEmails.length > 0) {
+            throw new AppError('MISSING_SIGNER_EMAIL', 400,
+              'All signers must have an email address for provider-backed signing.');
+          }
+
+          const { getSignedUrl } = await import('@aws-sdk/s3-request-presigner');
+          const { S3Client, GetObjectCommand } = await import('@aws-sdk/client-s3');
+          const s3 = new S3Client({ region: process.env.AWS_REGION || 'us-east-1' });
+          const docUrl = docVersion ? await getSignedUrl(
+            s3,
+            new GetObjectCommand({ Bucket: process.env.S3_DOCUMENTS_BUCKET || '', Key: docVersion.storage_key }),
+            { expiresIn: 900 },
+          ) : undefined;
+
+          const result = await provider.createRequest({
+            subject:          parsed.data.subject || `Please sign: ${doc.id.slice(-8)}`,
+            message:          parsed.data.message || 'Please review and sign this document.',
+            documentTitle:    doc.id,
+            documentUrl:      docUrl,
+            signers:          providerSigners,
+            internalRequestId: (sigReq as any).id,
+          });
+
+          // Store provider_request_id and update provider field
+          await queryOne(
+            `UPDATE document_service.signature_requests
+             SET provider = $1, provider_request_id = $2, updated_at = NOW()
+             WHERE id = $3`,
+            [providerName, result.providerRequestId, (sigReq as any).id],
+          );
+
+          // Store per-signer provider IDs and sign URLs
+          for (const providerSigner of result.signers) {
+            await queryOne(
+              `UPDATE document_service.signature_request_signers
+               SET provider_signer_id = $1, sign_url = $2
+               WHERE signature_request_id = $3 AND user_id = $4`,
+              [providerSigner.providerSignerId, providerSigner.signUrl,
+               (sigReq as any).id, providerSigner.userId],
+            );
+          }
+
+          logger.info(
+            { sigReqId: (sigReq as any).id, provider: providerName, providerRequestId: result.providerRequestId },
+            'Provider signature request created',
+          );
+        } catch (providerErr: any) {
+          logger.error({ err: providerErr.message, sigReqId: (sigReq as any).id }, 'Provider createRequest failed');
+          // Clean up the signature request rows we just created
+          await queryOne(
+            `DELETE FROM document_service.signature_requests WHERE id = $1`,
+            [(sigReq as any).id],
+          ).catch(() => {});
+          throw new AppError('PROVIDER_ERROR', 502,
+            `Failed to create signature request with provider: ${providerErr.message}`);
+        }
       }
 
       // Write CREATED event
@@ -448,6 +537,74 @@ router.post('/signature-requests/:id/sign', requireAuth,
       }
 
       res.json({ data: { signatureRequest: updatedReq, signer: updatedSigner } });
+    } catch (err) { next(err); }
+  },
+);
+
+// ═════════════════════════════════════════════════════════════════════════════
+// GET /signature-requests/:id/signing-url — Get fresh signing URL for the
+// authenticated tenant's signer slot (Phase 3)
+// ═════════════════════════════════════════════════════════════════════════════
+
+router.get('/signature-requests/:id/signing-url', requireAuth,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const user = (req as AuthenticatedRequest).user;
+
+      const sigReq = await queryOne<{
+        id: string; status: string; organization_id: string; provider: string;
+      }>(
+        `SELECT id, status, organization_id, provider
+         FROM document_service.signature_requests
+         WHERE id = $1 AND organization_id = $2`,
+        [req.params.id, user.orgId],
+      );
+      if (!sigReq) throw new NotFoundError('Signature request not found');
+
+      if (!['REQUESTED', 'PARTIALLY_SIGNED'].includes(sigReq.status)) {
+        throw new AppError('INVALID_STATE', 400,
+          `Cannot get signing URL for request in status '${sigReq.status}'.`);
+      }
+
+      // Find the signer row for this user
+      const signer = await queryOne<{
+        id: string; status: string; provider_signer_id: string | null; sign_url: string | null;
+      }>(
+        `SELECT id, status, provider_signer_id, sign_url
+         FROM document_service.signature_request_signers
+         WHERE signature_request_id = $1 AND user_id = $2`,
+        [req.params.id, user.userId],
+      );
+      if (!signer) throw new NotFoundError('You are not a signer on this request');
+
+      if (signer.status === 'SIGNED') {
+        return res.json({ data: { signUrl: null, alreadySigned: true, status: 'SIGNED' } });
+      }
+
+      // For provider-backed requests, get a fresh signing URL
+      if (sigReq.provider !== 'MANUAL' && signer.provider_signer_id) {
+        try {
+          const provider = getESignProvider();
+          const freshUrl = await provider.getSigningUrl(
+            req.params.id,            // we use internal ID; provider looks up via provider_signer_id
+            signer.provider_signer_id,
+          );
+
+          // Cache the refreshed URL
+          await queryOne(
+            `UPDATE document_service.signature_request_signers SET sign_url = $1 WHERE id = $2`,
+            [freshUrl, signer.id],
+          );
+
+          return res.json({ data: { signUrl: freshUrl, status: signer.status } });
+        } catch (err: any) {
+          logger.warn({ err: err.message, signerId: signer.id }, 'Failed to refresh signing URL from provider');
+          // Fall through to return cached URL if available
+        }
+      }
+
+      // Return cached URL (may be stale for provider-backed, always null for MANUAL)
+      return res.json({ data: { signUrl: signer.sign_url || null, status: signer.status } });
     } catch (err) { next(err); }
   },
 );
