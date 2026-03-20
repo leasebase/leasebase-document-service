@@ -8,11 +8,14 @@
 --
 -- Changes:
 --   1. Extend document_status_enum with Phase 1 vocabulary
---   2. Backfill legacy status values (EXECUTED → FULLY_EXECUTED, CONFIRMED_EXTERNAL → VERIFIED_EXTERNAL)
---   3. Add new columns to documents table (category, title, description, current_version_id, archived_at)
---   4. Create document_versions table
---   5. Create document_audit_events table
---   6. Add indexes
+--   2. Add new columns to documents table (category, title, description, current_version_id, archived_at)
+--   3. Create document_versions table
+--   4. Create document_audit_events table
+--   5. Add indexes
+--
+-- NOTE: The UPDATE backfill for EXECUTED→FULLY_EXECUTED / CONFIRMED_EXTERNAL→VERIFIED_EXTERNAL
+-- is in the companion migration 003b_document_schema_phase1_backfill.sql.
+-- It must run AFTER this migration commits the new enum values.
 --
 -- Run as leasebase_admin:
 --   psql -h <host> -U leasebase_admin -d leasebase -f db/migrations/003_document_schema_phase1.sql
@@ -29,22 +32,7 @@ ALTER TYPE document_service.document_status_enum ADD VALUE IF NOT EXISTS 'FULLY_
 ALTER TYPE document_service.document_status_enum ADD VALUE IF NOT EXISTS 'VERIFIED_EXTERNAL';
 ALTER TYPE document_service.document_status_enum ADD VALUE IF NOT EXISTS 'ARCHIVED';
 
--- ── 2. Backfill legacy statuses → Phase 1 vocabulary ──────────────────────
--- Must run AFTER enum extension (above). Rows with old values are migrated
--- to the semantically equivalent Phase 1 values.
--- EXECUTED          → FULLY_EXECUTED
--- CONFIRMED_EXTERNAL → VERIFIED_EXTERNAL
--- UPLOADED           → UPLOADED (unchanged)
-
-UPDATE document_service.documents
-SET status = 'FULLY_EXECUTED'::document_service.document_status_enum
-WHERE status = 'EXECUTED'::document_service.document_status_enum;
-
-UPDATE document_service.documents
-SET status = 'VERIFIED_EXTERNAL'::document_service.document_status_enum
-WHERE status = 'CONFIRMED_EXTERNAL'::document_service.document_status_enum;
-
--- ── 3. Add new columns to documents ─────────────────────────────────────────
+-- ── 2. Add new columns to documents ───────────────────────────────────────────────
 
 -- category: document classification (e.g. LEASE_AGREEMENT, MOVE_IN_CHECKLIST)
 DO $$ BEGIN
