@@ -42,6 +42,13 @@ async function emitNotification(payload: {
   relatedId?: string;
   metadata?: Record<string, unknown>;
 }): Promise<void> {
+  const logCtx = {
+    eventType:      payload.eventType,
+    organizationId: payload.organizationId,
+    recipientCount: payload.recipientUserIds.length,
+    relatedType:    payload.relatedType,
+    relatedId:      payload.relatedId,
+  };
   try {
     const res = await fetch(`${NOTIFICATION_SERVICE_URL}/internal/notifications/internal-emit`, {
       method: 'POST',
@@ -49,11 +56,19 @@ async function emitNotification(payload: {
       body: JSON.stringify(payload),
     });
     if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      logger.warn({ eventType: payload.eventType, status: res.status, body }, 'Notification emit failed (non-fatal)');
+      const responseBody = await res.text().catch(() => '');
+      logger.warn(
+        { ...logCtx, httpStatus: res.status, responseBody },
+        'Notification emit failed — HTTP error (non-fatal)',
+      );
+    } else {
+      logger.info(logCtx, 'Notification emitted successfully');
     }
-  } catch (err) {
-    logger.warn({ err, eventType: payload.eventType }, 'Notification emit threw (non-fatal)');
+  } catch (err: any) {
+    logger.warn(
+      { ...logCtx, errorMessage: err?.message ?? String(err) },
+      'Notification emit threw — network/config error (non-fatal)',
+    );
   }
 }
 
@@ -96,10 +111,12 @@ const updateTemplateSchema = z.object({
   is_active:   z.boolean().optional(),
 }).refine((d) => Object.keys(d).length > 0, { message: 'At least one field required' });
 
+// TEXT = in-DB content_text (supported for generation in Phase 2).
+// PDF / DOCX / HTML = S3-backed file storage (stored but NOT used for generation in Phase 2).
 const templateVersionUploadUrlSchema = z.object({
   fileName:      z.string().min(1),
   mimeType:      z.string().min(1),
-  sourceFormat:  z.enum(['PDF', 'DOCX', 'HTML']).default('PDF'),
+  sourceFormat:  z.enum(['TEXT', 'PDF', 'DOCX', 'HTML']).default('PDF'),
   contentText:   z.string().optional(),
 });
 
@@ -128,7 +145,7 @@ const generateSchema = z.object({
 // TEMPLATE ENDPOINTS
 // ═════════════════════════════════════════════════════════════════════════════
 
-// ── POST /templates — Create template ──────────────────────────────────────
+// ── POST /templates ─────────────────────────────────────────────────────────
 router.post('/', requireAuth, requireRole(UserRole.OWNER),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
@@ -184,8 +201,8 @@ router.get('/', requireAuth, requireRole(UserRole.OWNER),
   },
 );
 
-// ── GET /templates/:id — Get single template with latest version ─────────────
-router.get('/:id', requireAuth, requireRole(UserRole.OWNER),
+// ── GET /templates/:templateId ───────────────────────────────────────────────
+router.get('/:templateId', requireAuth, requireRole(UserRole.OWNER),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const user = (req as AuthenticatedRequest).user;
@@ -193,14 +210,14 @@ router.get('/:id', requireAuth, requireRole(UserRole.OWNER),
         `SELECT t.*
          FROM document_service.document_templates t
          WHERE t.id = $1 AND t.organization_id = $2`,
-        [req.params.id, user.orgId],
+        [req.params.templateId, user.orgId],
       );
       if (!row) throw new NotFoundError('Template not found');
 
       const versions = await query(
         `SELECT * FROM document_service.document_template_versions
          WHERE template_id = $1 ORDER BY version_number DESC`,
-        [req.params.id],
+        [req.params.templateId],
       );
 
       res.json({ data: { ...(row as any), versions } });
@@ -208,8 +225,8 @@ router.get('/:id', requireAuth, requireRole(UserRole.OWNER),
   },
 );
 
-// ── PATCH /templates/:id — Update template metadata ─────────────────────────
-router.patch('/:id', requireAuth, requireRole(UserRole.OWNER),
+// ── PATCH /templates/:templateId ─────────────────────────────────────────────
+router.patch('/:templateId', requireAuth, requireRole(UserRole.OWNER),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const user = (req as AuthenticatedRequest).user;
@@ -220,7 +237,7 @@ router.patch('/:id', requireAuth, requireRole(UserRole.OWNER),
 
       const existing = await queryOne(
         `SELECT id FROM document_service.document_templates WHERE id = $1 AND organization_id = $2`,
-        [req.params.id, user.orgId],
+        [req.params.templateId, user.orgId],
       );
       if (!existing) throw new NotFoundError('Template not found');
 
@@ -235,7 +252,7 @@ router.patch('/:id', requireAuth, requireRole(UserRole.OWNER),
       if (is_active !== undefined)  { sets.push(`is_active = $${idx}`);   values.push(is_active);   idx++; }
 
       sets.push(`updated_at = NOW()`);
-      values.push(req.params.id, user.orgId);
+      values.push(req.params.templateId, user.orgId);
 
       const row = await queryOne(
         `UPDATE document_service.document_templates
@@ -251,8 +268,8 @@ router.patch('/:id', requireAuth, requireRole(UserRole.OWNER),
   },
 );
 
-// ── DELETE /templates/:id — Archive template ──────────────────────────────
-router.delete('/:id', requireAuth, requireRole(UserRole.OWNER),
+// ── DELETE /templates/:templateId ────────────────────────────────────────────
+router.delete('/:templateId', requireAuth, requireRole(UserRole.OWNER),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const user = (req as AuthenticatedRequest).user;
@@ -261,7 +278,7 @@ router.delete('/:id', requireAuth, requireRole(UserRole.OWNER),
          SET is_active = false, updated_at = NOW()
          WHERE id = $1 AND organization_id = $2 AND is_active = true
          RETURNING id`,
-        [req.params.id, user.orgId],
+        [req.params.templateId, user.orgId],
       );
       if (!row) throw new NotFoundError('Template not found or already archived');
       res.status(204).send();
@@ -273,8 +290,8 @@ router.delete('/:id', requireAuth, requireRole(UserRole.OWNER),
 // TEMPLATE VERSIONS
 // ═════════════════════════════════════════════════════════════════════════════
 
-// ── POST /templates/:id/versions/upload-url ──────────────────────────────────
-router.post('/:id/versions/upload-url', requireAuth, requireRole(UserRole.OWNER),
+// ── POST /templates/:templateId/versions/upload-url ─────────────────────────
+router.post('/:templateId/versions/upload-url', requireAuth, requireRole(UserRole.OWNER),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const user = (req as AuthenticatedRequest).user;
@@ -286,7 +303,7 @@ router.post('/:id/versions/upload-url', requireAuth, requireRole(UserRole.OWNER)
       const tmpl = await queryOne<{ id: string; organization_id: string }>(
         `SELECT id, organization_id FROM document_service.document_templates
          WHERE id = $1 AND organization_id = $2`,
-        [req.params.id, user.orgId],
+        [req.params.templateId, user.orgId],
       );
       if (!tmpl) throw new NotFoundError('Template not found');
 
@@ -295,11 +312,11 @@ router.post('/:id/versions/upload-url', requireAuth, requireRole(UserRole.OWNER)
       // Get next version number
       const versionCount = await queryOne<{ count: string }>(
         `SELECT COUNT(*) as count FROM document_service.document_template_versions WHERE template_id = $1`,
-        [req.params.id],
+        [req.params.templateId],
       );
       const nextVersion = Number(versionCount?.count || 0) + 1;
 
-      const storageKey    = `${user.orgId}/templates/${req.params.id}/v${nextVersion}-${fileName}`;
+      const storageKey    = `${user.orgId}/templates/${req.params.templateId}/v${nextVersion}-${fileName}`;
       const storageBucket = S3_BUCKET || 'PENDING';
 
       const version = await queryOne(
@@ -308,7 +325,7 @@ router.post('/:id/versions/upload-url', requireAuth, requireRole(UserRole.OWNER)
             source_format, content_text, created_by_user_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7)
          RETURNING *`,
-        [req.params.id, nextVersion, storageBucket, storageKey,
+        [req.params.templateId, nextVersion, storageBucket, storageKey,
          sourceFormat, contentText || null, user.userId],
       );
 
@@ -324,8 +341,8 @@ router.post('/:id/versions/upload-url', requireAuth, requireRole(UserRole.OWNER)
   },
 );
 
-// ── POST /templates/:id/versions/upload-complete ─────────────────────────────
-router.post('/:id/versions/upload-complete', requireAuth, requireRole(UserRole.OWNER),
+// ── POST /templates/:templateId/versions/upload-complete ─────────────────────
+router.post('/:templateId/versions/upload-complete', requireAuth, requireRole(UserRole.OWNER),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const user = (req as AuthenticatedRequest).user;
@@ -336,21 +353,21 @@ router.post('/:id/versions/upload-complete', requireAuth, requireRole(UserRole.O
 
       const tmpl = await queryOne(
         `SELECT id FROM document_service.document_templates WHERE id = $1 AND organization_id = $2`,
-        [req.params.id, user.orgId],
+        [req.params.templateId, user.orgId],
       );
       if (!tmpl) throw new NotFoundError('Template not found');
 
       const version = await queryOne(
         `SELECT id FROM document_service.document_template_versions
          WHERE id = $1 AND template_id = $2`,
-        [parsed.data.versionId, req.params.id],
+        [parsed.data.versionId, req.params.templateId],
       );
       if (!version) throw new NotFoundError('Template version not found');
 
       // Update template's updated_at to signal a new version is ready
       await queryOne(
         `UPDATE document_service.document_templates SET updated_at = NOW() WHERE id = $1`,
-        [req.params.id],
+        [req.params.templateId],
       );
 
       res.json({ data: version });
@@ -362,22 +379,22 @@ router.post('/:id/versions/upload-complete', requireAuth, requireRole(UserRole.O
 // TEMPLATE VARIABLES
 // ═════════════════════════════════════════════════════════════════════════════
 
-// ── GET /templates/:id/variables — Get variables for latest version ───────────
-router.get('/:id/variables', requireAuth, requireRole(UserRole.OWNER),
+// ── GET /templates/:templateId/variables ─────────────────────────────────────
+router.get('/:templateId/variables', requireAuth, requireRole(UserRole.OWNER),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const user = (req as AuthenticatedRequest).user;
 
       const tmpl = await queryOne(
         `SELECT id FROM document_service.document_templates WHERE id = $1 AND organization_id = $2`,
-        [req.params.id, user.orgId],
+        [req.params.templateId, user.orgId],
       );
       if (!tmpl) throw new NotFoundError('Template not found');
 
       const latestVersion = await queryOne<{ id: string; version_number: number }>(
         `SELECT id, version_number FROM document_service.document_template_versions
          WHERE template_id = $1 ORDER BY version_number DESC LIMIT 1`,
-        [req.params.id],
+        [req.params.templateId],
       );
       if (!latestVersion) {
         return res.json({ data: [], versionId: null });
@@ -394,8 +411,8 @@ router.get('/:id/variables', requireAuth, requireRole(UserRole.OWNER),
   },
 );
 
-// ── PUT /templates/:id/variables — Replace variables for latest version ──────
-router.put('/:id/variables', requireAuth, requireRole(UserRole.OWNER),
+// ── PUT /templates/:templateId/variables ─────────────────────────────────────
+router.put('/:templateId/variables', requireAuth, requireRole(UserRole.OWNER),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const user = (req as AuthenticatedRequest).user;
@@ -406,14 +423,14 @@ router.put('/:id/variables', requireAuth, requireRole(UserRole.OWNER),
 
       const tmpl = await queryOne(
         `SELECT id FROM document_service.document_templates WHERE id = $1 AND organization_id = $2`,
-        [req.params.id, user.orgId],
+        [req.params.templateId, user.orgId],
       );
       if (!tmpl) throw new NotFoundError('Template not found');
 
       const latestVersion = await queryOne<{ id: string }>(
         `SELECT id FROM document_service.document_template_versions
          WHERE template_id = $1 ORDER BY version_number DESC LIMIT 1`,
-        [req.params.id],
+        [req.params.templateId],
       );
       if (!latestVersion) {
         throw new AppError('NO_VERSION', 400, 'Template has no uploaded version yet. Upload a version first.');
@@ -448,8 +465,8 @@ router.put('/:id/variables', requireAuth, requireRole(UserRole.OWNER),
 // GENERATION
 // ═════════════════════════════════════════════════════════════════════════════
 
-// ── POST /templates/:id/generate — Generate document from template ────────────
-router.post('/:id/generate', requireAuth, requireRole(UserRole.OWNER),
+// ── POST /templates/:templateId/generate ─────────────────────────────────────
+router.post('/:templateId/generate', requireAuth, requireRole(UserRole.OWNER),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const user = (req as AuthenticatedRequest).user;
@@ -466,7 +483,7 @@ router.post('/:id/generate', requireAuth, requireRole(UserRole.OWNER),
         `SELECT id, name, category, organization_id
          FROM document_service.document_templates
          WHERE id = $1 AND organization_id = $2 AND is_active = true`,
-        [req.params.id, user.orgId],
+        [req.params.templateId, user.orgId],
       );
       if (!tmpl) throw new NotFoundError('Template not found or inactive');
 
@@ -476,10 +493,22 @@ router.post('/:id/generate', requireAuth, requireRole(UserRole.OWNER),
         `SELECT id, version_number, content_text, storage_key
          FROM document_service.document_template_versions
          WHERE template_id = $1 ORDER BY version_number DESC LIMIT 1`,
-        [req.params.id],
+        [req.params.templateId],
       );
       if (!latestVersion) {
         throw new AppError('NO_VERSION', 400, 'Template has no uploaded version. Upload a version first.');
+      }
+
+      // Phase 2 generation only supports text-backed templates (content_text must be present).
+      // S3-backed versions (source_format=PDF/DOCX/HTML without content_text) are stored but
+      // cannot be used for generation until a provider rendering pipeline is added in Phase 3.
+      if (!latestVersion.content_text) {
+        throw new AppError(
+          'UNSUPPORTED_TEMPLATE_FORMAT', 422,
+          'This template version has no in-DB text content. ' +
+          'Phase 2 generation only supports text-backed templates. ' +
+          'Upload a new version with source_format=TEXT and a populated content_text body.',
+        );
       }
 
       // Validate required variables

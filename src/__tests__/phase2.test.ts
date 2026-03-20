@@ -349,7 +349,8 @@ describe('Template Generation', () => {
     activeUser.current = ownerUser;
     mockQueryOne
       .mockResolvedValueOnce({ id: 'tmpl-1', name: 'Lease', category: 'LEASE_AGREEMENT', organization_id: 'org-1' })
-      .mockResolvedValueOnce({ id: 'ver-1', version_number: 1, content_text: null, storage_key: 'k' });
+      // content_text must be non-null to pass the Change 4 text-backed guard and reach variable validation
+      .mockResolvedValueOnce({ id: 'ver-1', version_number: 1, content_text: 'Lease for {{tenant_name}}', storage_key: 'k' });
     mockQuery.mockResolvedValueOnce([
       { variable_key: 'tenant_name', label: 'Tenant Name' }, // required
     ]);
@@ -385,6 +386,22 @@ describe('Template Generation', () => {
     });
     expect(status).toBe(400);
     expect(body.error.code).toBe('NO_VERSION');
+  });
+
+  // Change 4: text-backed template guard
+  it('POST /t/:id/generate — returns 422 when latest version has no content_text (S3-only format)', async () => {
+    activeUser.current = ownerUser;
+    mockQueryOne
+      .mockResolvedValueOnce({ id: 'tmpl-1', name: 'Lease', category: 'LEASE_AGREEMENT', organization_id: 'org-1' })
+      .mockResolvedValueOnce({ id: 'ver-1', version_number: 1, content_text: null, storage_key: 's3-key' }); // S3-backed, no text
+    mockQuery.mockResolvedValueOnce([]); // required vars
+
+    const { status, body } = await req(port, 'POST', '/t/tmpl-1/generate', {
+      leaseId: 'lease-99',
+      variables: {},
+    });
+    expect(status).toBe(422);
+    expect(body.error.code).toBe('UNSUPPORTED_TEMPLATE_FORMAT');
   });
 });
 
@@ -483,10 +500,51 @@ describe('Signature Requests', () => {
     activeUser.current = ownerUser;
     mockQueryOne.mockResolvedValueOnce({ id: 'sig-1', status: 'COMPLETED', document_id: 'doc-1' });
 
-    const { status } = await req(port, 'PATCH', '/d/signature-requests/sig-1/status', {
+    const { status, body } = await req(port, 'PATCH', '/d/signature-requests/sig-1/status', {
       status: 'CANCELLED',
     });
     expect(status).toBe(400);
+    expect(body.error.code).toBe('INVALID_TRANSITION');
+  });
+
+  // Change 5: FAILED is also terminal — cannot be cancelled
+  it('PATCH /d/signature-requests/:id/status — returns 400 if FAILED (terminal, non-cancellable)', async () => {
+    activeUser.current = ownerUser;
+    mockQueryOne.mockResolvedValueOnce({ id: 'sig-1', status: 'FAILED', document_id: 'doc-1' });
+
+    const { status, body } = await req(port, 'PATCH', '/d/signature-requests/sig-1/status', {
+      status: 'CANCELLED',
+    });
+    expect(status).toBe(400);
+    expect(body.error.code).toBe('INVALID_TRANSITION');
+  });
+
+  // Change 5: DRAFT can be cancelled (valid transition)
+  it('PATCH /d/signature-requests/:id/status — can cancel from DRAFT status', async () => {
+    activeUser.current = ownerUser;
+    mockQueryOne
+      .mockResolvedValueOnce({ id: 'sig-1', status: 'DRAFT', document_id: 'doc-1' })
+      .mockResolvedValueOnce({ id: 'sig-1', status: 'CANCELLED' })
+      .mockResolvedValueOnce({ id: 'evt-1' });
+
+    const { status } = await req(port, 'PATCH', '/d/signature-requests/sig-1/status', {
+      status: 'CANCELLED',
+    });
+    expect(status).toBe(200);
+  });
+
+  // Change 5: COMPLETED/FAILED request cannot be signed
+  it('POST /d/signature-requests/:id/sign — returns 400 if request is COMPLETED', async () => {
+    activeUser.current = tenantUser;
+    mockQueryOne.mockResolvedValueOnce({
+      id: 'sig-1', status: 'COMPLETED', document_id: 'doc-1', organization_id: 'org-1',
+    });
+
+    const { status, body } = await req(port, 'POST', '/d/signature-requests/sig-1/sign', {
+      signerId: 'signer-1',
+    });
+    expect(status).toBe(400);
+    expect(body.error.code).toBe('INVALID_TRANSITION');
   });
 
   it('POST /d/signature-requests/:id/sign — signs the request', async () => {

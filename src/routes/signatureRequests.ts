@@ -24,6 +24,13 @@ async function emitNotification(payload: {
   relatedId?: string;
   metadata?: Record<string, unknown>;
 }): Promise<void> {
+  const logCtx = {
+    eventType:      payload.eventType,
+    organizationId: payload.organizationId,
+    recipientCount: payload.recipientUserIds.length,
+    relatedType:    payload.relatedType,
+    relatedId:      payload.relatedId,
+  };
   try {
     const res = await fetch(`${NOTIFICATION_SERVICE_URL}/internal/notifications/internal-emit`, {
       method: 'POST',
@@ -31,10 +38,42 @@ async function emitNotification(payload: {
       body: JSON.stringify(payload),
     });
     if (!res.ok) {
-      logger.warn({ eventType: payload.eventType, status: res.status }, 'Notification emit failed (non-fatal)');
+      const responseBody = await res.text().catch(() => '');
+      logger.warn(
+        { ...logCtx, httpStatus: res.status, responseBody },
+        'Notification emit failed — HTTP error (non-fatal)',
+      );
+    } else {
+      logger.info(logCtx, 'Notification emitted successfully');
     }
-  } catch (err) {
-    logger.warn({ err, eventType: payload.eventType }, 'Notification emit threw (non-fatal)');
+  } catch (err: any) {
+    logger.warn(
+      { ...logCtx, errorMessage: err?.message ?? String(err) },
+      'Notification emit threw — network/config error (non-fatal)',
+    );
+  }
+}
+
+// ── Signature request status transitions ─────────────────────────────────────────
+
+/** Statuses from which a signature request may be cancelled. */
+const CANCELLABLE_STATUSES = ['DRAFT', 'REQUESTED', 'PARTIALLY_SIGNED'] as const;
+
+/** Statuses from which a signer may record their signature. */
+const SIGNABLE_STATUSES = ['REQUESTED', 'PARTIALLY_SIGNED'] as const;
+
+/**
+ * Assert a signature request can be cancelled from its current status.
+ * COMPLETED and FAILED are terminal — cannot be cancelled.
+ * CANCELLED is idempotent (handled separately before calling this).
+ */
+function assertCancellable(currentStatus: string): void {
+  if (!(CANCELLABLE_STATUSES as readonly string[]).includes(currentStatus)) {
+    throw new AppError(
+      'INVALID_TRANSITION', 400,
+      `Cannot cancel a signature request in status '${currentStatus}'. ` +
+      `Allowed source statuses: ${CANCELLABLE_STATUSES.join(', ')}.`,
+    );
   }
 }
 
@@ -261,9 +300,8 @@ router.patch('/signature-requests/:id/status', requireAuth, requireRole(UserRole
         return res.json({ data: sigReq, alreadyCancelled: true });
       }
 
-      if (sigReq.status === 'COMPLETED') {
-        throw new AppError('INVALID_TRANSITION', 400, 'Cannot cancel a completed signature request.');
-      }
+      // Validate transition — COMPLETED/FAILED are terminal and cannot be cancelled
+      assertCancellable(sigReq.status);
 
       const updated = await queryOne(
         `UPDATE document_service.signature_requests
@@ -310,9 +348,12 @@ router.post('/signature-requests/:id/sign', requireAuth,
       );
       if (!sigReq) throw new NotFoundError('Signature request not found');
 
-      if (!['REQUESTED', 'PARTIALLY_SIGNED'].includes(sigReq.status)) {
-        throw new AppError('INVALID_STATE', 400,
-          `Cannot sign a request in status '${sigReq.status}'.`);
+      if (!(SIGNABLE_STATUSES as readonly string[]).includes(sigReq.status)) {
+        throw new AppError(
+          'INVALID_TRANSITION', 400,
+          `Cannot sign a request in status '${sigReq.status}'. ` +
+          `Allowed source statuses: ${SIGNABLE_STATUSES.join(', ')}.`,
+        );
       }
 
       // Verify the signer row belongs to this user
