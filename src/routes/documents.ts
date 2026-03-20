@@ -2,7 +2,7 @@ import { Router, type Request, type Response, type NextFunction } from 'express'
 import { z } from 'zod';
 import {
   requireAuth, requireRole, validateBody,
-  query, queryOne, NotFoundError, logger,
+  query, queryOne, NotFoundError, AppError, logger,
   parsePagination, paginationMeta,
   type AuthenticatedRequest, UserRole,
 } from '@leasebase/service-common';
@@ -14,11 +14,77 @@ const S3_BUCKET = process.env.S3_DOCUMENTS_BUCKET || '';
 // Note: In production, presigned URLs are generated via AWS SDK S3 client.
 // For now, we store metadata in DB and return presigned URL placeholders.
 
+// ── Document status constants ────────────────────────────────────────────────
+// These are the durable lifecycle states for a lease document.
+//   UPLOADED           — stored but not yet confirmed/executed
+//   EXECUTED           — signed/executed through the platform
+//   CONFIRMED_EXTERNAL — owner confirmed an externally-executed doc is on file
+//
+// A document is considered "activation-sufficient" when its status is either
+// EXECUTED or CONFIRMED_EXTERNAL.  The lease-service activation gate queries
+// this table before promoting ACKNOWLEDGED → ACTIVE.
+export const DOCUMENT_STATUSES = ['UPLOADED', 'EXECUTED', 'CONFIRMED_EXTERNAL'] as const;
+export const ACTIVATABLE_STATUSES = ['EXECUTED', 'CONFIRMED_EXTERNAL'] as const;
+
 const uploadSchema = z.object({
   relatedType: z.string().min(1),
   relatedId: z.string().min(1),
   name: z.string().min(1),
   mimeType: z.string().min(1),
+});
+
+const confirmSchema = z.object({
+  /** New status — owner can promote a document to EXECUTED or CONFIRMED_EXTERNAL. */
+  status: z.enum(['EXECUTED', 'CONFIRMED_EXTERNAL']),
+});
+
+// ── Internal service key validation ─────────────────────────────────────────
+// Validates X-Internal-Service-Key header for service-to-service calls.
+// Returns true if key is valid, false (and sends 401) if not.
+// NOTE: env var is read lazily (at call time, not module load time) so that
+// test environments can set it after module initialization.
+function validateInternalKey(req: Request, res: Response): boolean {
+  const configuredKey = process.env.INTERNAL_SERVICE_KEY || '';
+  const key = req.headers['x-internal-service-key'];
+  if (!configuredKey || key !== configuredKey) {
+    res.status(401).json({ error: { code: 'UNAUTHORIZED', message: 'Invalid or missing internal service key' } });
+    return false;
+  }
+  return true;
+}
+
+// ── GET /lease-proof — Internal: check if a lease has qualifying document proof ──
+//
+// Used by lease-service before activating a lease.
+// Returns { qualified: boolean } where qualified=true means at least one
+// LEASE document with status EXECUTED or CONFIRMED_EXTERNAL exists for the lease.
+//
+// Protected by INTERNAL_SERVICE_KEY — not exposed to public clients.
+// The BFF gateway does NOT proxy /internal/* routes to public callers.
+//
+// Query parameters:
+//   leaseId       - the lease ID to check
+//   organizationId - org scoping guard
+router.get('/lease-proof', (req: Request, res: Response, next: NextFunction) => {
+  if (!validateInternalKey(req, res)) return;
+  const { leaseId, organizationId } = req.query as { leaseId?: string; organizationId?: string };
+  if (!leaseId || !organizationId) {
+    return res.status(400).json({ error: { code: 'MISSING_PARAMS', message: 'leaseId and organizationId are required' } });
+  }
+  queryOne<{ id: string; status: string }>(
+    `SELECT id, status
+     FROM documents
+     WHERE related_id = $1
+       AND related_type = 'LEASE'
+       AND organization_id = $2
+       AND status IN ('EXECUTED', 'CONFIRMED_EXTERNAL')
+     LIMIT 1`,
+    [leaseId, organizationId],
+  )
+    .then((row) => {
+      res.json({ qualified: !!row, document: row || null });
+    })
+    .catch(next);
 });
 
 // GET / - List documents
@@ -84,6 +150,8 @@ router.get('/mine', requireAuth, async (req: Request, res: Response, next: NextF
 });
 
 // POST /upload - Upload document (returns presigned upload URL)
+// Status is set to UPLOADED on creation; owner must subsequently confirm/mark
+// as EXECUTED or CONFIRMED_EXTERNAL before lease activation is allowed.
 router.post('/upload', requireAuth, requireRole(UserRole.OWNER),
   validateBody(uploadSchema),
   async (req: Request, res: Response, next: NextFunction) => {
@@ -94,19 +162,65 @@ router.post('/upload', requireAuth, requireRole(UserRole.OWNER),
       const s3Key = `${user.orgId}/${relatedType}/${relatedId}/${Date.now()}-${name}`;
 
       const row = await queryOne(
-        `INSERT INTO documents (organization_id, related_type, related_id, name, s3_key, mime_type, created_by_user_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
-        [user.orgId, relatedType, relatedId, name, s3Key, mimeType, user.userId]
+        `INSERT INTO documents
+         (organization_id, related_type, related_id, name, s3_key, mime_type, created_by_user_id, status, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'UPLOADED', NOW())
+         RETURNING *`,
+        [user.orgId, relatedType, relatedId, name, s3Key, mimeType, user.userId],
       );
 
       // In production, generate presigned PUT URL:
       // const url = await getSignedUrl(s3Client, new PutObjectCommand({Bucket, Key: s3Key, ContentType: mimeType}), {expiresIn: 3600});
       const uploadUrl = S3_BUCKET ? `https://${S3_BUCKET}.s3.amazonaws.com/${s3Key}` : `placeholder://upload/${s3Key}`;
 
-      logger.info({ documentId: (row as any)?.id, s3Key }, 'Document metadata created');
+      logger.info({ documentId: (row as any)?.id, s3Key, status: 'UPLOADED' }, 'Document metadata created');
       res.status(201).json({ data: row, uploadUrl });
     } catch (err) { next(err); }
-  }
+  },
+);
+
+// POST /:id/confirm - Owner confirms document execution status
+// Promotes a document to EXECUTED or CONFIRMED_EXTERNAL.
+// This is the machine-checkable signal that satisfies the lease activation gate.
+router.post('/:id/confirm', requireAuth, requireRole(UserRole.OWNER),
+  validateBody(confirmSchema),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const user = (req as AuthenticatedRequest).user;
+      const { status } = req.body as { status: 'EXECUTED' | 'CONFIRMED_EXTERNAL' };
+
+      // Verify ownership and that the current status allows promotion
+      const existing = await queryOne<{ id: string; status: string; related_type: string; related_id: string }>(
+        `SELECT id, status, related_type, related_id FROM documents
+         WHERE id = $1 AND organization_id = $2`,
+        [req.params.id, user.orgId],
+      );
+      if (!existing) throw new NotFoundError('Document not found');
+
+      // Allow UPLOADED → EXECUTED or CONFIRMED_EXTERNAL (idempotent if already at target)
+      if (existing.status === status) {
+        return res.json({ data: existing });
+      }
+      if (!(['UPLOADED', 'EXECUTED', 'CONFIRMED_EXTERNAL'] as string[]).includes(existing.status)) {
+        throw new AppError('INVALID_STATUS', 400, `Cannot confirm document in status: ${existing.status}`);
+      }
+
+      const row = await queryOne(
+        `UPDATE documents SET status = $1, updated_at = NOW()
+         WHERE id = $2 AND organization_id = $3
+         RETURNING *`,
+        [status, req.params.id, user.orgId],
+      );
+      if (!row) throw new NotFoundError('Document not found');
+
+      logger.info(
+        { documentId: req.params.id, newStatus: status, relatedType: existing.related_type, relatedId: existing.related_id },
+        'Document status confirmed by owner',
+      );
+
+      res.json({ data: row });
+    } catch (err) { next(err); }
+  },
 );
 
 // GET /:id - Get document metadata (OWNER or TENANT with lease-ownership check)
