@@ -273,7 +273,16 @@ router.post('/upload-url', requireAuth, requireRole(UserRole.OWNER),
       logger.info({ documentId: (doc as any).id, storageKey, category }, 'Upload URL generated');
 
       res.status(201).json({ data: doc, version, uploadUrl, storageKey });
-    } catch (err) { next(err); }
+    } catch (err: any) {
+      // Log structured detail for DB/schema errors to accelerate debugging
+      if (err?.code || err?.constraint || err?.column) {
+        logger.error(
+          { pgCode: err.code, constraint: err.constraint, column: err.column, detail: err.detail, table: err.table },
+          'upload-url DB error — possible schema drift or NOT NULL violation',
+        );
+      }
+      next(err);
+    }
   },
 );
 
