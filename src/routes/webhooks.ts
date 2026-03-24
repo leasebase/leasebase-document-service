@@ -19,6 +19,7 @@
 import { Router, type Request, type Response } from 'express';
 import {
   queryOne, query, AppError, logger,
+  emitNotification,
 } from '@leasebase/service-common';
 import { getESignProvider } from '../providers/esign/index.js';
 import type { ProviderEventType } from '../providers/esign/index.js';
@@ -27,7 +28,6 @@ export const webhooksRouter = Router();
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const LEASE_SERVICE_URL        = process.env.LEASE_SERVICE_URL        || 'http://localhost:3003';
-const NOTIFICATION_SERVICE_URL = process.env.NOTIFICATION_SERVICE_URL || 'http://localhost:3007';
 const INTERNAL_SERVICE_KEY     = process.env.INTERNAL_SERVICE_KEY     || '';
 
 // ── Downstream helpers ────────────────────────────────────────────────────────
@@ -50,29 +50,7 @@ async function triggerLeaseActivation(leaseId: string, orgId: string): Promise<v
   logger.info({ leaseId, orgId, status: res.status }, 'Webhook: lease activation triggered');
 }
 
-async function emitNotification(payload: {
-  organizationId: string;
-  recipientUserIds: string[];
-  eventType: string;
-  title: string;
-  body: string;
-  relatedType?: string;
-  relatedId?: string;
-  metadata?: Record<string, unknown>;
-}): Promise<void> {
-  try {
-    const res = await fetch(`${NOTIFICATION_SERVICE_URL}/internal/notifications/internal-emit`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Internal-Service-Key': INTERNAL_SERVICE_KEY },
-      body: JSON.stringify(payload),
-    });
-    if (!res.ok) {
-      logger.warn({ eventType: payload.eventType, status: res.status }, 'Webhook notification emit failed (non-fatal)');
-    }
-  } catch (err: any) {
-    logger.warn({ err: err?.message, eventType: payload.eventType }, 'Webhook notification emit threw (non-fatal)');
-  }
-}
+// emitNotification is now imported from @leasebase/service-common
 
 // ── Signer status from provider event type ────────────────────────────────────
 
