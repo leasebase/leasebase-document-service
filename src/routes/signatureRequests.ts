@@ -2,6 +2,7 @@ import { Router, type Request, type Response, type NextFunction } from 'express'
 import { z } from 'zod';
 import {
   requireAuth, requireRole, queryOne, query, NotFoundError, AppError, logger,
+  emitNotification,
   type AuthenticatedRequest, UserRole,
 } from '@leasebase/service-common';
 import { getESignProvider } from '../providers/esign/index.js';
@@ -13,47 +14,7 @@ const NOTIFICATION_SERVICE_URL = process.env.NOTIFICATION_SERVICE_URL || 'http:/
 const LEASE_SERVICE_URL        = process.env.LEASE_SERVICE_URL        || 'http://localhost:3003';
 const INTERNAL_SERVICE_KEY     = process.env.INTERNAL_SERVICE_KEY     || '';
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-async function emitNotification(payload: {
-  organizationId: string;
-  recipientUserIds: string[];
-  eventType: string;
-  title: string;
-  body: string;
-  relatedType?: string;
-  relatedId?: string;
-  metadata?: Record<string, unknown>;
-}): Promise<void> {
-  const logCtx = {
-    eventType:      payload.eventType,
-    organizationId: payload.organizationId,
-    recipientCount: payload.recipientUserIds.length,
-    relatedType:    payload.relatedType,
-    relatedId:      payload.relatedId,
-  };
-  try {
-    const res = await fetch(`${NOTIFICATION_SERVICE_URL}/internal/notifications/internal-emit`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Internal-Service-Key': INTERNAL_SERVICE_KEY },
-      body: JSON.stringify(payload),
-    });
-    if (!res.ok) {
-      const responseBody = await res.text().catch(() => '');
-      logger.warn(
-        { ...logCtx, httpStatus: res.status, responseBody },
-        'Notification emit failed — HTTP error (non-fatal)',
-      );
-    } else {
-      logger.info(logCtx, 'Notification emitted successfully');
-    }
-  } catch (err: any) {
-    logger.warn(
-      { ...logCtx, errorMessage: err?.message ?? String(err) },
-      'Notification emit threw — network/config error (non-fatal)',
-    );
-  }
-}
+// emitNotification is now imported from @leasebase/service-common
 
 // ── Signature request status transitions ─────────────────────────────────────────
 
